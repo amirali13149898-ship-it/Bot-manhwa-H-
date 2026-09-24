@@ -86,10 +86,30 @@ async def set_setting(key, value):
         await q_insert("settings", {"key": key, "value": value}, upsert_on="key")
 
 
-async def is_admin(uid: int) -> bool:
+PERMS = {
+    "stats": "📊 آمار ربات",
+    "upload": "📤 آپلود فایل",
+    "locks": "🔒 قفل ها",
+    "broadcast": "📨 ارسال همگانی",
+    "settings": "⚙️ تنظیمات",
+    "admins": "👥 مدیریت ادمین ها",
+}
+DEFAULT_PERMS = {"stats", "upload"}
+
+
+async def get_perms(uid: int) -> set:
     if uid == OWNER_ID:
-        return True
-    return bool(await q_select("admins", {"id": f"eq.{uid}"}))
+        return set(PERMS)
+    if not await q_select("admins", {"id": f"eq.{uid}"}):
+        return set()
+    v = await get_setting(f"perms:{uid}")
+    if v is None:  # admins added before permissions existed keep full access
+        return set(PERMS)
+    return {x for x in v.split(",") if x in PERMS}
+
+
+async def is_admin(uid: int) -> bool:
+    return bool(await get_perms(uid))
 
 
 def now_iso() -> str:
@@ -110,12 +130,36 @@ def kb(rows):
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-ADMIN_KB = kb([[B_STATS, B_BC], [B_UP, B_LOCKS], [B_SET, B_EXIT]])
+def admin_kb(perms):
+    order = [("stats", B_STATS), ("broadcast", B_BC), ("upload", B_UP),
+             ("locks", B_LOCKS), ("settings", B_SET), ("admins", B_ADMINS)]
+    btns = [label for key, label in order if key in perms]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([B_EXIT])
+    return kb(rows)
+
+
+def perm_markup(target, perms):
+    rows = [[InlineKeyboardButton(("✅ " if k in perms else "⬜️ ") + label,
+                                  callback_data=f"pm:{target}:{k}")] for k, label in PERMS.items()]
+    rows.append([InlineKeyboardButton("👑 دسترسی کامل (مثل مالک)", callback_data=f"pm:{target}:all")])
+    rows.append([InlineKeyboardButton("✔️ تمام", callback_data="pm_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+BTN_PERM = {B_STATS: "stats", B_UP: "upload", B_SINGLE: "upload", B_GROUP: "upload",
+            B_DONE: "upload", B_LOCKS: "locks", B_BC: "broadcast", B_SET: "settings",
+            B_START_TXT: "settings", B_CAPTION: "settings", B_AUTODEL: "settings",
+            B_ADMINS: "admins"}
+STATE_PERM = {"up_single": "upload", "up_group": "upload", "lock_add": "locks",
+              "broadcast": "broadcast", "set_start": "settings", "set_caption": "settings",
+              "set_autodel": "settings", "add_admin": "admins"}
 DEFAULT_START = "سلام 👋\nبرای دریافت فایل از لینک اختصاصی استفاده کن."
 
 
 async def panel(msg):
-    await msg.reply_text("به پنل مدیریت خوش اومدی 🌹", reply_markup=ADMIN_KB)
+    perms = await get_perms(msg.chat_id)
+    await msg.reply_text("به پنل مدیریت خوش اومدی 🌹", reply_markup=admin_kb(perms))
 
 
 # ─────────────────────────────── locks / delivery ────────────────────────────
@@ -142,11 +186,17 @@ async def check_locks(bot, uid):
     return missing, optional
 
 
-async def delete_later(bot, chat_id, ids, delay):
+async def delete_later(bot, chat_id, ids, delay, notice_id=None, markup=None):
     await asyncio.sleep(delay)
     for mid in ids:
         try:
             await bot.delete_message(chat_id, mid)
+        except TelegramError:
+            pass
+    if notice_id:
+        try:
+            await bot.edit_message_text("🗑 فایل‌ها پاک شدن. اگه هنوز لازمشون داری دکمه‌ی زیر رو بزن 👇",
+                                        chat_id=chat_id, message_id=notice_id, reply_markup=markup)
         except TelegramError:
             pass
 
@@ -193,13 +243,16 @@ async def serve(chat_id, uid, code, ctx, query=None):
             log.exception("send failed")
         await asyncio.sleep(0.05)
     if ttl > 0 and sent:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 دانلود مجدد", callback_data=f"re:{code}")]])
+        notice_id = None
         try:
             notice = await ctx.bot.send_message(
-                chat_id, f"⏱ این فایل‌ها بعد از {ttl} ثانیه پاک می‌شن. ذخیره‌شون کن یا جای دیگه فوروارد کن.")
-            sent.append(notice.message_id)
+                chat_id, f"⏱ این فایل‌ها بعد از {ttl} ثانیه پاک می‌شن. ذخیره‌شون کن یا جای دیگه فوروارد کن.",
+                reply_markup=markup)
+            notice_id = notice.message_id
         except TelegramError:
             pass
-        ctx.application.create_task(delete_later(ctx.bot, chat_id, sent, ttl))
+        ctx.application.create_task(delete_later(ctx.bot, chat_id, sent, ttl, notice_id, markup))
     await q_update("links", {"code": code}, {"downloads": link[0]["downloads"] + 1})
 
 
@@ -287,18 +340,15 @@ async def show_locks(msg):
         reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def show_admins(msg, uid):
+async def show_admins(msg):
     rows = await q_select("admins")
-    owner = uid == OWNER_ID
-    btns = [[InlineKeyboardButton(f"✖️ {r['id']}", callback_data=f"adm_del:{r['id']}")]
-            for r in rows] if owner else []
-    if owner:
-        btns.append([InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm_add")])
+    btns = [[InlineKeyboardButton(f"⚙️ {r['id']}", callback_data=f"pm_open:{r['id']}"),
+             InlineKeyboardButton("✖️ حذف", callback_data=f"adm_del:{r['id']}")] for r in rows]
+    btns.append([InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm_add")])
     ids = ", ".join(str(r["id"]) for r in rows) or "—"
     await msg.reply_text(
-        f"👥 مالک: {OWNER_ID}\nادمین‌ها: {ids}\n\n"
-        + ("روی آیدی بزنی حذف می‌شه." if owner else "فقط مالک می‌تونه ادمین اضافه/حذف کنه."),
-        reply_markup=InlineKeyboardMarkup(btns) if btns else None)
+        f"👥 مالک: {OWNER_ID}\nادمین‌ها: {ids}\n\nروی ⚙️ بزنی دسترسی‌های اون ادمین رو تنظیم می‌کنی.",
+        reply_markup=InlineKeyboardMarkup(btns))
 
 
 async def broadcast(ctx, admin_chat, src_chat, src_msg):
@@ -348,11 +398,22 @@ def norm_target(t):
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg, uid = update.effective_message, update.effective_user.id
-    if not await is_admin(uid):
+    perms = await get_perms(uid)
+    if not perms:
         return
+    kb_admin = admin_kb(perms)
     text = (msg.text or "").strip()
     ud = ctx.user_data
     st = ud.get("state")
+
+    if text in (B_BACK, B_CANCEL, B_EXIT):
+        req = None
+    else:
+        req = BTN_PERM.get(text) or STATE_PERM.get(st)
+    if req and req not in perms:
+        ud.clear()
+        await msg.reply_text("⛔️ به این بخش دسترسی نداری.", reply_markup=kb_admin)
+        return
 
     # ---- menu buttons ----
     if text == B_EXIT:
@@ -391,7 +452,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         link = await make_link(ctx, batch)
         ud.clear()
-        await msg.reply_text(f"✅ {len(batch)} فایل ذخیره شد.\n\n🔗 {link}", reply_markup=ADMIN_KB)
+        await msg.reply_text(f"✅ {len(batch)} فایل ذخیره شد.\n\n🔗 {link}", reply_markup=kb_admin)
         return
     if text == B_LOCKS:
         await show_locks(msg)
@@ -404,7 +465,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if text == B_SET:
         ud.clear()
-        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_AUTODEL, B_ADMINS], [B_BACK]]))
+        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_AUTODEL], [B_BACK]]))
         return
     if text == B_START_TXT:
         ud.clear()
@@ -430,7 +491,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb([[B_CANCEL]]))
         return
     if text == B_ADMINS:
-        await show_admins(msg, uid)
+        await show_admins(msg)
         return
 
     # ---- states ----
@@ -451,14 +512,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if st == "broadcast":
         ud.clear()
         ctx.application.create_task(broadcast(ctx, msg.chat_id, msg.chat_id, msg.message_id))
-        await msg.reply_text("⏳ ارسال شروع شد. وقتی تموم شد خبرت می‌کنم.", reply_markup=ADMIN_KB)
+        await msg.reply_text("⏳ ارسال شروع شد. وقتی تموم شد خبرت می‌کنم.", reply_markup=kb_admin)
         return
 
     if st == "set_autodel":
         if text.isdigit() and (int(text) == 0 or 5 <= int(text) <= 3600):
             await set_setting("autodelete", None if int(text) == 0 else text)
             ud.clear()
-            await msg.reply_text("✅ ذخیره شد.", reply_markup=ADMIN_KB)
+            await msg.reply_text("✅ ذخیره شد.", reply_markup=kb_admin)
         else:
             await msg.reply_text("یه عدد بین 5 تا 3600 بفرست (یا 0 برای خاموش).")
         return
@@ -467,14 +528,19 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         key = "start_text" if st == "set_start" else "default_caption"
         await set_setting(key, None if text == "-" else msg.text)
         ud.clear()
-        await msg.reply_text("✅ ذخیره شد.", reply_markup=ADMIN_KB)
+        await msg.reply_text("✅ ذخیره شد.", reply_markup=kb_admin)
         return
 
     if st == "add_admin":
-        if uid == OWNER_ID and text.isdigit():
-            await q_insert("admins", {"id": int(text)}, upsert_on="id")
+        if text.isdigit():
+            n = int(text)
+            await q_insert("admins", {"id": n}, upsert_on="id")
+            if await get_setting(f"perms:{n}") is None:
+                await set_setting(f"perms:{n}", ",".join(sorted(DEFAULT_PERMS)))
+            cur = await get_perms(n)
             ud.clear()
-            await msg.reply_text("✅ ادمین اضافه شد.", reply_markup=ADMIN_KB)
+            await msg.reply_text("✅ ادمین اضافه شد.", reply_markup=kb_admin)
+            await msg.reply_text(f"🔐 دسترسی‌های {n} رو انتخاب کن:", reply_markup=perm_markup(n, cur))
         else:
             await msg.reply_text("آیدی عددی کاربر رو بفرست.")
         return
@@ -525,11 +591,16 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     d, uid, ud = q.data, q.from_user.id, ctx.user_data
 
-    if d.startswith("chk:"):
-        await serve(q.message.chat_id, uid, d[4:], ctx, query=q)
+    if d.startswith(("chk:", "re:")):
+        await serve(q.message.chat_id, uid, d.split(":", 1)[1], ctx, query=q)
         return
-    if not await is_admin(uid):
+    perms = await get_perms(uid)
+    if not perms:
         await q.answer("⛔️", show_alert=True)
+        return
+    need = "locks" if d.startswith("lk_") else "admins" if d.startswith(("adm_", "pm")) else None
+    if need and need not in perms:
+        await q.answer("⛔️ دسترسی نداری", show_alert=True)
         return
 
     if d == "lk_add":
@@ -550,14 +621,43 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q_delete("locks", {"chat_id": d.split(":", 1)[1]})
         await q.answer("🗑 حذف شد")
         await q.message.edit_text("🗑 قفل حذف شد. برای دیدن لیست دوباره «قفل ها» رو بزن.")
-    elif d == "adm_add" and uid == OWNER_ID:
+    elif d == "adm_add":
         ud["state"] = "add_admin"
         await q.answer()
         await q.message.reply_text("آیدی عددی ادمین جدید رو بفرست.", reply_markup=kb([[B_CANCEL]]))
-    elif d.startswith("adm_del:") and uid == OWNER_ID:
-        await q_delete("admins", {"id": d.split(":", 1)[1]})
+    elif d.startswith("adm_del:"):
+        tid = d.split(":", 1)[1]
+        await q_delete("admins", {"id": tid})
+        await q_delete("settings", {"key": f"perms:{tid}"})
         await q.answer("🗑 حذف شد")
         await q.message.edit_text("🗑 ادمین حذف شد.")
+    elif d.startswith("pm_open:"):
+        tid = int(d.split(":", 1)[1])
+        await q.answer()
+        await q.message.reply_text(f"🔐 دسترسی‌های {tid}:", reply_markup=perm_markup(tid, await get_perms(tid)))
+    elif d.startswith("pm:"):
+        _, tid, k = d.split(":", 2)
+        tid = int(tid)
+        if tid == OWNER_ID:
+            await q.answer("مالک همیشه دسترسی کامل داره.", show_alert=True)
+            return
+        if not await q_select("admins", {"id": f"eq.{tid}"}):
+            await q.answer("این ادمین حذف شده.", show_alert=True)
+            return
+        cur = await get_perms(tid)
+        if k == "all":
+            cur = set(PERMS)
+        elif k in PERMS:
+            cur ^= {k}
+        await set_setting(f"perms:{tid}", ",".join(sorted(cur)))
+        await q.answer()
+        try:
+            await q.message.edit_reply_markup(reply_markup=perm_markup(tid, cur))
+        except TelegramError:
+            pass
+    elif d == "pm_done":
+        await q.answer("✅ ذخیره شد")
+        await q.message.edit_text("✅ دسترسی‌ها ذخیره شد.")
     else:
         await q.answer()
 
