@@ -103,6 +103,7 @@ B_SET, B_EXIT = "⚙️ تنظیمات", "🔙 خروج از پنل"
 B_BACK, B_CANCEL = "🔙 بازگشت به پنل", "❌ لغو"
 B_SINGLE, B_GROUP, B_DONE = "📤 آپلود تکی", "📦 آپلود گروهی", "✅ پایان آپلود"
 B_START_TXT, B_CAPTION, B_ADMINS = "📝 متن استارت", "🖊 کپشن پیشفرض", "👥 ادمین ها"
+B_AUTODEL = "⏱ حذف خودکار"
 
 
 def kb(rows):
@@ -141,6 +142,15 @@ async def check_locks(bot, uid):
     return missing, optional
 
 
+async def delete_later(bot, chat_id, ids, delay):
+    await asyncio.sleep(delay)
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except TelegramError:
+            pass
+
+
 async def serve(chat_id, uid, code, ctx, query=None):
     link = await q_select("links", {"code": f"eq.{code}"})
     if not link:
@@ -172,13 +182,24 @@ async def serve(chat_id, uid, code, ctx, query=None):
 
     files = await q_select("files", {"code": f"eq.{code}", "order": "position.asc"})
     default_cap = await get_setting("default_caption")
+    ttl = int(await get_setting("autodelete") or 0)
+    sent = []
     for f in files:
         cap = f["caption"] or default_cap
         try:
-            await getattr(ctx.bot, "send_" + f["file_type"])(chat_id, f["file_id"], caption=cap)
+            m = await getattr(ctx.bot, "send_" + f["file_type"])(chat_id, f["file_id"], caption=cap)
+            sent.append(m.message_id)
         except TelegramError:
             log.exception("send failed")
         await asyncio.sleep(0.05)
+    if ttl > 0 and sent:
+        try:
+            notice = await ctx.bot.send_message(
+                chat_id, f"⏱ این فایل‌ها بعد از {ttl} ثانیه پاک می‌شن. ذخیره‌شون کن یا جای دیگه فوروارد کن.")
+            sent.append(notice.message_id)
+        except TelegramError:
+            pass
+        ctx.application.create_task(delete_later(ctx.bot, chat_id, sent, ttl))
     await q_update("links", {"code": code}, {"downloads": link[0]["downloads"] + 1})
 
 
@@ -366,7 +387,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if text == B_SET:
         ud.clear()
-        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_ADMINS], [B_BACK]]))
+        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_AUTODEL, B_ADMINS], [B_BACK]]))
         return
     if text == B_START_TXT:
         ud.clear()
@@ -381,6 +402,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur = await get_setting("default_caption") or "(تنظیم نشده)"
         await msg.reply_text(f"کپشن پیشفرض فعلی:\n{cur}\n\nکپشن جدید رو بفرست. برای حذف بفرست: -",
                              reply_markup=kb([[B_CANCEL]]))
+        return
+    if text == B_AUTODEL:
+        ud.clear()
+        ud["state"] = "set_autodel"
+        cur = int(await get_setting("autodelete") or 0)
+        await msg.reply_text(
+            f"حذف خودکار فعلی: {'خاموش' if cur == 0 else str(cur) + ' ثانیه'}\n\n"
+            "تعداد ثانیه رو بفرست (بین 5 تا 3600). برای خاموش کردن بفرست: 0",
+            reply_markup=kb([[B_CANCEL]]))
         return
     if text == B_ADMINS:
         await show_admins(msg, uid)
@@ -405,6 +435,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ud.clear()
         ctx.application.create_task(broadcast(ctx, msg.chat_id, msg.chat_id, msg.message_id))
         await msg.reply_text("⏳ ارسال شروع شد. وقتی تموم شد خبرت می‌کنم.", reply_markup=ADMIN_KB)
+        return
+
+    if st == "set_autodel":
+        if text.isdigit() and (int(text) == 0 or 5 <= int(text) <= 3600):
+            await set_setting("autodelete", None if int(text) == 0 else text)
+            ud.clear()
+            await msg.reply_text("✅ ذخیره شد.", reply_markup=ADMIN_KB)
+        else:
+            await msg.reply_text("یه عدد بین 5 تا 3600 بفرست (یا 0 برای خاموش).")
         return
 
     if st in ("set_start", "set_caption") and text:
