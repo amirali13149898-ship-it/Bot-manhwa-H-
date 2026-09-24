@@ -1,0 +1,53 @@
+-- Run once in Supabase → SQL Editor
+
+create table if not exists users (
+  id bigint primary key,
+  first_name text,
+  joined_at timestamptz default now(),
+  last_seen timestamptz default now(),
+  active boolean default true
+);
+
+create table if not exists admins (
+  id bigint primary key
+);
+
+create table if not exists links (
+  code text primary key,
+  downloads int default 0,
+  created_at timestamptz default now()
+);
+
+create table if not exists files (
+  id bigserial primary key,
+  code text references links(code) on delete cascade,
+  file_id text not null,
+  file_type text not null,
+  caption text,
+  position int default 0
+);
+
+create table if not exists locks (
+  chat_id bigint primary key,
+  title text,
+  link text,
+  mandatory boolean default true
+);
+
+create table if not exists settings (
+  key text primary key,
+  value text
+);
+
+-- The bot uses the service_role key (bypasses RLS). Enabling RLS with no
+-- policies blocks anyone using the public anon key.
+alter table users enable row level security;
+alter table admins enable row level security;
+alter table links enable row level security;
+alter table files enable row level security;
+alter table locks enable row level security;
+alter table settings enable row level security;
+
+create index if not exists users_last_seen_idx on users (last_seen);
+create index if not exists users_joined_at_idx on users (joined_at);
+create index if not exists files_code_idx on files (code);
