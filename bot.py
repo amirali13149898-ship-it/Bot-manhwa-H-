@@ -124,6 +124,7 @@ B_BACK, B_CANCEL = "🔙 بازگشت به پنل", "❌ لغو"
 B_SINGLE, B_GROUP, B_DONE = "📤 آپلود تکی", "📦 آپلود گروهی", "✅ پایان آپلود"
 B_START_TXT, B_CAPTION, B_ADMINS = "📝 متن استارت", "🖊 کپشن پیشفرض", "👥 ادمین ها"
 B_AUTODEL = "⏱ حذف خودکار"
+B_WARN_TXT, B_GONE_TXT = "⚠️ متن هشدار حذف", "🗑 متن بعد از حذف"
 
 
 def kb(rows):
@@ -150,11 +151,18 @@ def perm_markup(target, perms):
 BTN_PERM = {B_STATS: "stats", B_UP: "upload", B_SINGLE: "upload", B_GROUP: "upload",
             B_DONE: "upload", B_LOCKS: "locks", B_BC: "broadcast", B_SET: "settings",
             B_START_TXT: "settings", B_CAPTION: "settings", B_AUTODEL: "settings",
+            B_WARN_TXT: "settings", B_GONE_TXT: "settings",
             B_ADMINS: "admins"}
 STATE_PERM = {"up_single": "upload", "up_group": "upload", "lock_add": "locks",
               "broadcast": "broadcast", "set_start": "settings", "set_caption": "settings",
-              "set_autodel": "settings", "add_admin": "admins"}
+              "set_autodel": "settings", "set_warn": "settings", "set_gone": "settings",
+              "add_admin": "admins"}
 DEFAULT_START = "سلام 👋\nبرای دریافت فایل از لینک اختصاصی استفاده کن."
+DEFAULT_WARN = "⏱ این فایل‌ها بعد از {n} ثانیه پاک می‌شن. ذخیره‌شون کن یا جای دیگه فوروارد کن."
+DEFAULT_GONE = "🗑 فایل‌ها پاک شدن. اگه هنوز لازمشون داری دکمه‌ی زیر رو بزن 👇"
+REDL_SECONDS = 60  # how long the re-download button stays after files are deleted
+TEXT_KEYS = {"set_start": "start_text", "set_caption": "default_caption",
+             "set_warn": "warn_text", "set_gone": "gone_text"}
 
 
 async def panel(msg):
@@ -186,19 +194,24 @@ async def check_locks(bot, uid):
     return missing, optional
 
 
-async def delete_later(bot, chat_id, ids, delay, notice_id=None, markup=None):
+async def delete_later(bot, chat_id, ids, delay, notice_id=None, gone_text="", markup=None):
     await asyncio.sleep(delay)
     for mid in ids:
         try:
             await bot.delete_message(chat_id, mid)
         except TelegramError:
             pass
-    if notice_id:
-        try:
-            await bot.edit_message_text("🗑 فایل‌ها پاک شدن. اگه هنوز لازمشون داری دکمه‌ی زیر رو بزن 👇",
-                                        chat_id=chat_id, message_id=notice_id, reply_markup=markup)
-        except TelegramError:
-            pass
+    if not notice_id:
+        return
+    try:  # files are gone -> show the re-download button for a limited time
+        await bot.edit_message_text(gone_text, chat_id=chat_id, message_id=notice_id, reply_markup=markup)
+    except TelegramError:
+        return
+    await asyncio.sleep(REDL_SECONDS)
+    try:
+        await bot.delete_message(chat_id, notice_id)
+    except TelegramError:
+        pass
 
 
 async def serve(chat_id, uid, code, ctx, query=None):
@@ -243,16 +256,16 @@ async def serve(chat_id, uid, code, ctx, query=None):
             log.exception("send failed")
         await asyncio.sleep(0.05)
     if ttl > 0 and sent:
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 دانلود مجدد", callback_data=f"re:{code}")]])
+        warn = (await get_setting("warn_text") or DEFAULT_WARN).replace("{n}", str(ttl))
+        gone = await get_setting("gone_text") or DEFAULT_GONE
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 دریافت مجدد", callback_data=f"re:{code}")]])
         notice_id = None
         try:
-            notice = await ctx.bot.send_message(
-                chat_id, f"⏱ این فایل‌ها بعد از {ttl} ثانیه پاک می‌شن. ذخیره‌شون کن یا جای دیگه فوروارد کن.",
-                reply_markup=markup)
+            notice = await ctx.bot.send_message(chat_id, warn)
             notice_id = notice.message_id
         except TelegramError:
             pass
-        ctx.application.create_task(delete_later(ctx.bot, chat_id, sent, ttl, notice_id, markup))
+        ctx.application.create_task(delete_later(ctx.bot, chat_id, sent, ttl, notice_id, gone, markup))
     await q_update("links", {"code": code}, {"downloads": link[0]["downloads"] + 1})
 
 
@@ -465,7 +478,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if text == B_SET:
         ud.clear()
-        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_AUTODEL], [B_BACK]]))
+        await msg.reply_text("تنظیمات:", reply_markup=kb([[B_START_TXT, B_CAPTION], [B_WARN_TXT, B_GONE_TXT], [B_AUTODEL], [B_BACK]]))
         return
     if text == B_START_TXT:
         ud.clear()
@@ -479,6 +492,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ud["state"] = "set_caption"
         cur = await get_setting("default_caption") or "(تنظیم نشده)"
         await msg.reply_text(f"کپشن پیشفرض فعلی:\n{cur}\n\nکپشن جدید رو بفرست. برای حذف بفرست: -",
+                             reply_markup=kb([[B_CANCEL]]))
+        return
+    if text in (B_WARN_TXT, B_GONE_TXT):
+        ud.clear()
+        new_state = "set_warn" if text == B_WARN_TXT else "set_gone"
+        default = DEFAULT_WARN if new_state == "set_warn" else DEFAULT_GONE
+        cur = await get_setting(TEXT_KEYS[new_state]) or default
+        ud["state"] = new_state
+        hint = "\n(هر جا {n} بذاری، به جاش تعداد ثانیه میاد)" if new_state == "set_warn" else ""
+        await msg.reply_text(f"متن فعلی:\n{cur}\n{hint}\n\nمتن جدید رو بفرست. برای برگشت به متن پیشفرض بفرست: -",
                              reply_markup=kb([[B_CANCEL]]))
         return
     if text == B_AUTODEL:
@@ -524,8 +547,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("یه عدد بین 5 تا 3600 بفرست (یا 0 برای خاموش).")
         return
 
-    if st in ("set_start", "set_caption") and text:
-        key = "start_text" if st == "set_start" else "default_caption"
+    if st in TEXT_KEYS and text:
+        key = TEXT_KEYS[st]
         await set_setting(key, None if text == "-" else msg.text)
         ud.clear()
         await msg.reply_text("✅ ذخیره شد.", reply_markup=kb_admin)
