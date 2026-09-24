@@ -32,9 +32,10 @@ _http = None
 def http() -> httpx.AsyncClient:
     global _http
     if _http is None:
-        _http = httpx.AsyncClient(
-            base_url=SB_URL, timeout=20,
-            headers={"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"})
+        headers = {"apikey": SB_KEY}
+        if SB_KEY.startswith("eyJ"):  # legacy service_role JWT key
+            headers["Authorization"] = f"Bearer {SB_KEY}"
+        _http = httpx.AsyncClient(base_url=SB_URL, timeout=20, headers=headers)
     return _http
 
 
