@@ -329,6 +329,23 @@ async def broadcast(ctx, admin_chat, src_chat, src_msg):
     await ctx.bot.send_message(admin_chat, f"📨 ارسال همگانی تموم شد.\n✅ موفق: {ok}\n❌ ناموفق: {fail}")
 
 
+def norm_target(t):
+    """Turn @name / t.me/name / https://t.me/name / -100123 into something get_chat accepts."""
+    t = (t or "").strip()
+    if not t:
+        return None
+    for pfx in ("https://t.me/", "http://t.me/", "https://telegram.me/", "t.me/", "telegram.me/"):
+        if t.lower().startswith(pfx):
+            t = t[len(pfx):]
+            break
+    t = t.split("?")[0].strip("/ ")
+    if not t or t.startswith("+") or t.lower().startswith("joinchat") or "/" in t:
+        return None
+    if t.lstrip("-").isdigit():
+        return int(t)
+    return t if t.startswith("@") else "@" + t
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg, uid = update.effective_message, update.effective_user.id
     if not await is_admin(uid):
@@ -464,20 +481,35 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if st == "lock_add":
         fo = getattr(msg, "forward_origin", None)
-        target = fo.chat.id if fo is not None and getattr(fo, "chat", None) else text
-        if not target:
-            await msg.reply_text("یوزرنیم (@channel) یا آیدی عددی رو بفرست، یا یه پیام از کانال فوروارد کن.")
-            return
+        if fo is not None and getattr(fo, "chat", None):
+            target = fo.chat.id
+        else:
+            target = norm_target(text)
+            if target is None:
+                await msg.reply_text(
+                    "یوزرنیم (@channel)، لینک t.me/channel، یا آیدی عددی بفرست، یا یه پیام از کانال فوروارد کن.\n"
+                    "(لینک دعوت خصوصی با + پشتیبانی نمی‌شه؛ برای کانال خصوصی پیام فوروارد کن.)")
+                return
         try:
             chat = await ctx.bot.get_chat(target)
+        except TelegramError:
+            await msg.reply_text("❌ چت پیدا نشد. یوزرنیم رو چک کن، یا ربات رو اول ادمین کانال کن و پیام فوروارد کن.")
+            return
+        try:
             me = await ctx.bot.get_chat_member(chat.id, ctx.bot.id)
-            if me.status not in (S.ADMINISTRATOR, S.OWNER):
-                await msg.reply_text("❌ ربات تو اون چت ادمین نیست. اول ادمینش کن.")
-                return
+            bot_is_admin = me.status in (S.ADMINISTRATOR, S.OWNER)
+        except TelegramError:
+            bot_is_admin = False
+        if not bot_is_admin:
+            await msg.reply_text(
+                f"❌ ربات تو «{chat.title}» ادمین نیست.\n"
+                "کانال → مدیران → افزودن مدیر → ربات رو اضافه کن، بعد دوباره امتحان کن.")
+            return
+        try:
             link = (f"https://t.me/{chat.username}" if chat.username
                     else chat.invite_link or await ctx.bot.export_chat_invite_link(chat.id))
-        except TelegramError as e:
-            await msg.reply_text(f"❌ نتونستم چت رو پیدا کنم یا لینک بگیرم: {e.message}")
+        except TelegramError:
+            await msg.reply_text("❌ نتونستم لینک دعوت بگیرم. به ربات دسترسی «دعوت کاربران با لینک» بده.")
             return
         ud["pending_lock"] = {"chat_id": chat.id, "title": chat.title or str(chat.id), "link": link}
         ud["state"] = None
